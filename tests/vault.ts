@@ -5,6 +5,10 @@
  *   1. Admin создаёт vault (initialize_vault)
  *   2. Пользователи A и B создают свои карточки (create_user_card)
  *   3. Повторное создание карточки A падает
+ *   4. created_at записывается в карточку
+ *   5. Админ ставит vault на паузу -> create_user_card падает
+ *   6. Не-админ не может ставить паузу
+ *   7. close_user_card закрывает карточку и возвращает ренту владельцу
  */
 
 import * as anchor from "@coral-xyz/anchor";
@@ -41,6 +45,7 @@ describe("simple_vault", () => {
   const admin = (provider.wallet as anchor.Wallet).payer;
   const userA = Keypair.generate();
   const userB = Keypair.generate();
+  const userC = Keypair.generate();
 
   let tokenMint: PublicKey;
   let vaultStatePDA: PublicKey;
@@ -56,6 +61,7 @@ describe("simple_vault", () => {
   before(async () => {
     await fundFromAdmin(provider, admin, userA.publicKey);
     await fundFromAdmin(provider, admin, userB.publicKey);
+    await fundFromAdmin(provider, admin, userC.publicKey);
 
     tokenMint = await createMint(provider.connection, admin, admin.publicKey, null, 6);
 
@@ -89,6 +95,7 @@ describe("simple_vault", () => {
     assert.equal(vault.admin.toBase58(), admin.publicKey.toBase58());
     assert.equal(vault.tokenMint.toBase58(), tokenMint.toBase58());
     assert.equal(vault.shareMint.toBase58(), shareMintPDA.toBase58());
+    assert.isFalse(vault.paused, "новый vault не на паузе");
   });
 
   it("create_user_card: у каждого пользователя своя карточка", async () => {
@@ -103,6 +110,7 @@ describe("simple_vault", () => {
       const card = await program.account.userCard.fetch(userCard);
       assert.equal(card.owner.toBase58(), user.publicKey.toBase58());
       assert.equal(card.vault.toBase58(), vaultStatePDA.toBase58());
+      assert.isAbove(card.createdAt.toNumber(), 0, "created_at должен быть заполнен");
     }
     assert.notEqual(cardPda(userA.publicKey).toBase58(), cardPda(userB.publicKey).toBase58());
   });
@@ -123,5 +131,96 @@ describe("simple_vault", () => {
       failed = true;
     }
     assert.isTrue(failed, "повторная карточка должна быть отклонена");
+  });
+
+  it("set_paused: не-админ не может поставить паузу", async () => {
+    let failed = false;
+    try {
+      await program.methods
+        .setPaused(true)
+        .accounts({ vaultState: vaultStatePDA, admin: userA.publicKey } as any)
+        .signers([userA])
+        .rpc();
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, "пауза от не-админа должна быть отклонена");
+  });
+
+  it("paused: на паузе карточку создать нельзя", async () => {
+    await program.methods
+      .setPaused(true)
+      .accounts({ vaultState: vaultStatePDA, admin: admin.publicKey } as any)
+      .rpc();
+    assert.isTrue((await program.account.vaultState.fetch(vaultStatePDA)).paused);
+
+    let failed = false;
+    try {
+      await program.methods
+        .createUserCard()
+        .accounts({
+          vaultState: vaultStatePDA,
+          userCard: cardPda(userC.publicKey),
+          user: userC.publicKey,
+        } as any)
+        .signers([userC])
+        .rpc();
+    } catch (e: any) {
+      failed = true;
+      assert.include(String(e), "VaultPaused");
+    }
+    assert.isTrue(failed, "создание на паузе должно быть отклонено");
+  });
+
+  it("paused: после снятия с паузы карточка создаётся", async () => {
+    await program.methods
+      .setPaused(false)
+      .accounts({ vaultState: vaultStatePDA, admin: admin.publicKey } as any)
+      .rpc();
+
+    const userCard = cardPda(userC.publicKey);
+    await program.methods
+      .createUserCard()
+      .accounts({ vaultState: vaultStatePDA, userCard, user: userC.publicKey } as any)
+      .signers([userC])
+      .rpc();
+    const card = await program.account.userCard.fetch(userCard);
+    assert.equal(card.owner.toBase58(), userC.publicKey.toBase58());
+  });
+
+  it("close_user_card: карточка закрыта, рента возвращена владельцу", async () => {
+    const userCard = cardPda(userA.publicKey);
+    const cardLamports = await provider.connection.getBalance(userCard);
+    assert.isAbove(cardLamports, 0);
+    const before = await provider.connection.getBalance(userA.publicKey);
+
+    await program.methods
+      .closeUserCard()
+      .accounts({ vaultState: vaultStatePDA, userCard, owner: userA.publicKey } as any)
+      .signers([userA])
+      .rpc();
+
+    assert.isNull(await provider.connection.getAccountInfo(userCard), "аккаунт должен быть закрыт");
+    const after = await provider.connection.getBalance(userA.publicKey);
+    // рента вернулась (минус комиссия за транзакцию, она < 0.001 SOL)
+    assert.isAbove(after, before + cardLamports - 0.001 * LAMPORTS_PER_SOL);
+  });
+
+  it("close_user_card: чужую карточку закрыть нельзя", async () => {
+    let failed = false;
+    try {
+      await program.methods
+        .closeUserCard()
+        .accounts({
+          vaultState: vaultStatePDA,
+          userCard: cardPda(userB.publicKey),
+          owner: userA.publicKey,
+        } as any)
+        .signers([userA])
+        .rpc();
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, "закрыть чужую карточку нельзя");
   });
 });

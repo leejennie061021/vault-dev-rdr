@@ -1,6 +1,6 @@
-# Simple Vault — практика Anchor
+# Simple Vault — неделя 8
 
-Учебный контракт на Anchor 0.31.1 (Solana). Сейчас он делает две вещи:
+Учебный контракт на Anchor 0.31.1 (Solana). Сейчас он делает следующее:
 
 1. **Vault создан** — админ создаёт vault для SPL-токена.
 2. **У каждого пользователя своя «карточка»** — пользователь создаёт личный аккаунт (PDA) внутри vault.
@@ -13,7 +13,9 @@
 
 ```
 initialize_vault    создаёт VaultState PDA, vault token account и share mint
-create_user_card    создаёт UserCard PDA — личную карточку пользователя в vault
+create_user_card    создаёт UserCard PDA (с created_at); запрещено, если vault на паузе
+close_user_card     закрывает UserCard, рента возвращается владельцу
+set_paused          админ ставит vault на паузу / снимает с паузы
 ```
 
 ### `initialize_vault`
@@ -35,9 +37,21 @@ create_user_card    создаёт UserCard PDA — личную карточк�
 | `vault` | к какому vault относится карточка |
 | `owner` | владелец карточки |
 | `bump` | bump PDA |
+| `created_at` | unix timestamp создания (`Clock::get()?.unix_timestamp`) |
+
+Если `vault_state.paused == true`, вызов завершается ошибкой `VaultPaused`.
 
 Seeds: `["user_card", vault_state, user]` — поэтому у одного пользователя в одном vault
 может быть **только одна** карточка. Повторный вызов завершится ошибкой.
+
+### `close_user_card`
+
+Вызывает владелец карточки. Аккаунт `UserCard` закрывается (`close = owner`), рента возвращается владельцу.
+Работает и на паузе. Чужую карточку закрыть нельзя (`has_one = owner` + seeds).
+
+### `set_paused(paused: bool)`
+
+Вызывает только админ vault (`has_one = admin`). Флаг `paused` в `VaultState` блокирует `create_user_card`.
 
 ---
 
@@ -119,7 +133,12 @@ yarn test
 ✔ initialize_vault: vault создан
 ✔ create_user_card: у каждого пользователя своя карточка
 ✔ create_user_card: вторая карточка для того же пользователя — ошибка
-3 passing
+✔ set_paused: не-админ не может поставить паузу
+✔ paused: на паузе карточку создать нельзя
+✔ paused: после снятия с паузы карточка создаётся
+✔ close_user_card: карточка закрыта, рента возвращена владельцу
+✔ close_user_card: чужую карточку закрыть нельзя
+8 passing
 ```
 
 ---
@@ -147,8 +166,11 @@ vault-simple/
 
 ---
 
-## Задания для практики
+## Задания для практики (выполнено)
 
-1. Добавить в `UserCard` поле `created_at` (`Clock::get()?.unix_timestamp`).
-2. Добавить инструкцию `close_user_card`, которая закрывает карточку и возвращает ренту владельцу.
-3. Запретить создание карточек, если vault поставлен админом на паузу (флаг `paused` в `VaultState`).
+1. ✅ `UserCard.created_at` (`Clock::get()?.unix_timestamp`).
+2. ✅ Инструкция `close_user_card` — закрывает карточку и возвращает ренту владельцу.
+3. ✅ Флаг `paused` в `VaultState` + инструкция `set_paused`; на паузе `create_user_card` падает с `VaultPaused`.
+
+> ⚠️ Размер `VaultState` и `UserCard` изменился. Для уже созданных на devnet аккаунтов
+> схема не подойдёт — используй новый `token_mint` (новый vault) или передеплой программу.
