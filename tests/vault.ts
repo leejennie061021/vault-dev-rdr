@@ -3,21 +3,17 @@
  *
  * Сценарий:
  *   1. Admin создаёт vault (initialize_vault)
- *   2. Пользователь A вносит 100 токенов → получает shares
- *   3. Пользователь B вносит 50 токенов → получает shares
- *   4. Пользователь A выводит половину своих shares
- *   5. Проверяем балансы и корректность долей
+ *   2. Пользователи A и B создают свои карточки (create_user_card)
+ *   3. Повторное создание карточки A падает
+ *   4. A вносит 100 токенов → 100 shares, B вносит 50 → 50 shares
+ *   5. Депозит без карточки и депозит 0 — ошибки
+ *   6. A возвращает 50 shares → получает 50 токенов, B выводит всё
+ *   7. Вывод 0, вывод больше своих shares и вывод без карточки — ошибки
  */
 
 import * as anchor from "@coral-xyz/anchor";
-import { Program, BN } from "@coral-xyz/anchor";
-import {
-  createMint,
-  createAccount,
-  mintTo,
-  getAccount,
-  TOKEN_PROGRAM_ID,
-} from "@solana/spl-token";
+import { Program } from "@coral-xyz/anchor";
+import { createMint, createAccount, mintTo, getAccount, getMint } from "@solana/spl-token";
 import {
   Keypair,
   PublicKey,
@@ -28,104 +24,92 @@ import {
 import { assert } from "chai";
 import { SimpleVault } from "../target/types/simple_vault";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 // Переводим SOL от admin → pubkey (обходит rate limit devnet airdrop)
 async function fundFromAdmin(
   provider: anchor.AnchorProvider,
   admin: Keypair,
   pubkey: PublicKey,
-  lamports = 0.3 * LAMPORTS_PER_SOL
+  lamports = 0.05 * LAMPORTS_PER_SOL
 ) {
   const tx = new Transaction().add(
-    SystemProgram.transfer({
-      fromPubkey: admin.publicKey,
-      toPubkey: pubkey,
-      lamports,
-    })
+    SystemProgram.transfer({ fromPubkey: admin.publicKey, toPubkey: pubkey, lamports })
   );
   await provider.sendAndConfirm(tx, [admin]);
-  console.log(`  Funded → ${pubkey.toBase58().slice(0, 8)}... (${lamports / LAMPORTS_PER_SOL} SOL)`);
 }
-
-// Читаем баланс токен-аккаунта (возвращает число токенов)
-async function tokenBalance(
-  connection: anchor.web3.Connection,
-  ata: PublicKey
-): Promise<bigint> {
-  const info = await getAccount(connection, ata);
-  return info.amount;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Setup
-// ─────────────────────────────────────────────────────────────────────────────
 
 describe("simple_vault", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
   const program = anchor.workspace.SimpleVault as Program<SimpleVault>;
-  const connection = provider.connection;
-
-  // Кошельки участников
   const admin = (provider.wallet as anchor.Wallet).payer;
   const userA = Keypair.generate();
   const userB = Keypair.generate();
 
-  // SPL-токен для практики (создаём сами)
   let tokenMint: PublicKey;
-
-  // Токен-аккаунты пользователей
-  let userATokenAccount: PublicKey;
-  let userBTokenAccount: PublicKey;
-
-  // Share-аккаунты пользователей
-  let userAShareAccount: PublicKey;
-  let userBShareAccount: PublicKey;
-
-  // PDAs
   let vaultStatePDA: PublicKey;
   let vaultTokenAccountPDA: PublicKey;
   let shareMintPDA: PublicKey;
 
-  // Количество токенов (decimals = 6, как USDC)
-  const TOKEN_DECIMALS = 6;
-  const DEPOSIT_A = new BN(100 * 10 ** TOKEN_DECIMALS); // 100 токенов
-  const DEPOSIT_B = new BN(50 * 10 ** TOKEN_DECIMALS);  //  50 токенов
+  // Токен-аккаунты (токен vault) и share-аккаунты пользователей
+  const userC = Keypair.generate(); // без карточки
+  const tokenAcc: Record<string, PublicKey> = {};
+  const shareAcc: Record<string, PublicKey> = {};
+  const UNIT = 1_000_000; // decimals = 6
 
-  // ─── before: airdrop + создание токена ─────────────────────────────────────
+  const deposit = (user: Keypair, amount: number) =>
+    program.methods
+      .deposit(new anchor.BN(amount))
+      .accounts({
+        vaultState: vaultStatePDA,
+        userCard: cardPda(user.publicKey),
+        vaultTokenAccount: vaultTokenAccountPDA,
+        shareMint: shareMintPDA,
+        userTokenAccount: tokenAcc[user.publicKey.toBase58()],
+        userShareAccount: shareAcc[user.publicKey.toBase58()],
+        user: user.publicKey,
+      } as any)
+      .signers([user])
+      .rpc();
+
+  const withdraw = (user: Keypair, sharesAmount: number) =>
+    program.methods
+      .withdraw(new anchor.BN(sharesAmount))
+      .accounts({
+        vaultState: vaultStatePDA,
+        userCard: cardPda(user.publicKey),
+        vaultTokenAccount: vaultTokenAccountPDA,
+        shareMint: shareMintPDA,
+        userTokenAccount: tokenAcc[user.publicKey.toBase58()],
+        userShareAccount: shareAcc[user.publicKey.toBase58()],
+        user: user.publicKey,
+      } as any)
+      .signers([user])
+      .rpc();
+
+  const mustFail = async (fn: () => Promise<string>, msg: string) => {
+    let failed = false;
+    try {
+      await fn();
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, msg);
+  };
+
+  const cardPda = (user: PublicKey) =>
+    PublicKey.findProgramAddressSync(
+      [Buffer.from("user_card"), vaultStatePDA.toBuffer(), user.toBuffer()],
+      program.programId
+    )[0];
+
   before(async () => {
-    console.log("\n=== Setup ===");
-
-    // Финансируем пользователей переводом от admin (devnet airdrop имеет rate limit)
     await fundFromAdmin(provider, admin, userA.publicKey);
     await fundFromAdmin(provider, admin, userB.publicKey);
+    await fundFromAdmin(provider, admin, userC.publicKey);
 
-    // Создаём тестовый SPL-токен (admin = mint authority)
-    tokenMint = await createMint(
-      connection,
-      admin,
-      admin.publicKey, // mintAuthority
-      null,            // freezeAuthority
-      TOKEN_DECIMALS
-    );
-    console.log(`  Token mint: ${tokenMint.toBase58()}`);
+    tokenMint = await createMint(provider.connection, admin, admin.publicKey, null, 6);
 
-    // Создаём токен-аккаунты для пользователей
-    userATokenAccount = await createAccount(connection, admin, tokenMint, userA.publicKey);
-    userBTokenAccount = await createAccount(connection, admin, tokenMint, userB.publicKey);
-
-    // Минтим начальные токены пользователям
-    await mintTo(connection, admin, tokenMint, userATokenAccount, admin, 1000 * 10 ** TOKEN_DECIMALS);
-    await mintTo(connection, admin, tokenMint, userBTokenAccount, admin, 1000 * 10 ** TOKEN_DECIMALS);
-
-    console.log(`  UserA token balance: 1000`);
-    console.log(`  UserB token balance: 1000`);
-
-    // Вычисляем PDAs
     [vaultStatePDA] = PublicKey.findProgramAddressSync(
       [Buffer.from("vault"), tokenMint.toBuffer()],
       program.programId
@@ -138,192 +122,190 @@ describe("simple_vault", () => {
       [Buffer.from("share_mint"), tokenMint.toBuffer()],
       program.programId
     );
-
-    console.log(`  Vault PDA:        ${vaultStatePDA.toBase58()}`);
-    console.log(`  Vault tokens PDA: ${vaultTokenAccountPDA.toBase58()}`);
-    console.log(`  Share mint PDA:   ${shareMintPDA.toBase58()}`);
-
-    // Создаём share-аккаунты для пользователей
-    // (после initialize_vault, когда share_mint уже создан в chain)
   });
 
-  // ─── 1. initialize_vault ───────────────────────────────────────────────────
-  it("initialize_vault: создаёт vault PDA, token account и share mint", async () => {
-    const tx = await program.methods
+  it("initialize_vault: vault создан", async () => {
+    await program.methods
       .initializeVault()
-      .accountsPartial({
+      .accounts({
         vaultState: vaultStatePDA,
         vaultTokenAccount: vaultTokenAccountPDA,
         shareMint: shareMintPDA,
-        tokenMint: tokenMint,
+        tokenMint,
         admin: admin.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: anchor.web3.SystemProgram.programId,
-        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-      })
-      .signers([admin])
+      } as any)
       .rpc();
 
-    console.log(`\n  initialize_vault tx: ${tx}`);
-
-    // Проверяем vault state
     const vault = await program.account.vaultState.fetch(vaultStatePDA);
     assert.equal(vault.admin.toBase58(), admin.publicKey.toBase58());
     assert.equal(vault.tokenMint.toBase58(), tokenMint.toBase58());
-    assert.equal(vault.totalTokens.toString(), "0");
-    assert.equal(vault.totalShares.toString(), "0");
-
-    // Теперь создаём share-аккаунты пользователей (share_mint уже существует)
-    userAShareAccount = await createAccount(connection, admin, shareMintPDA, userA.publicKey);
-    userBShareAccount = await createAccount(connection, admin, shareMintPDA, userB.publicKey);
-
-    console.log(`  ✓ VaultState.totalTokens = 0, totalShares = 0`);
+    assert.equal(vault.shareMint.toBase58(), shareMintPDA.toBase58());
   });
 
-  // ─── 2. UserA deposit 100 ──────────────────────────────────────────────────
-  it("deposit: UserA вносит 100 токенов → получает 100 shares (1:1 первый депозит)", async () => {
-    const balanceBefore = await tokenBalance(connection, userATokenAccount);
+  it("create_user_card: у каждого пользователя своя карточка", async () => {
+    for (const user of [userA, userB]) {
+      const userCard = cardPda(user.publicKey);
+      await program.methods
+        .createUserCard()
+        .accounts({ vaultState: vaultStatePDA, userCard, user: user.publicKey } as any)
+        .signers([user])
+        .rpc();
 
-    const tx = await program.methods
-      .deposit(DEPOSIT_A)
-      .accountsPartial({
-        vaultState: vaultStatePDA,
-        vaultTokenAccount: vaultTokenAccountPDA,
-        shareMint: shareMintPDA,
-        userTokenAccount: userATokenAccount,
-        userShareAccount: userAShareAccount,
-        user: userA.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([userA])
-      .rpc();
+      const card = await program.account.userCard.fetch(userCard);
+      assert.equal(card.owner.toBase58(), user.publicKey.toBase58());
+      assert.equal(card.vault.toBase58(), vaultStatePDA.toBase58());
+    }
+    assert.notEqual(cardPda(userA.publicKey).toBase58(), cardPda(userB.publicKey).toBase58());
+  });
 
-    console.log(`\n  UserA deposit tx: ${tx}`);
+  it("create_user_card: вторая карточка для того же пользователя — ошибка", async () => {
+    let failed = false;
+    try {
+      await program.methods
+        .createUserCard()
+        .accounts({
+          vaultState: vaultStatePDA,
+          userCard: cardPda(userA.publicKey),
+          user: userA.publicKey,
+        } as any)
+        .signers([userA])
+        .rpc();
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, "повторная карточка должна быть отклонена");
+  });
 
-    const balanceAfter = await tokenBalance(connection, userATokenAccount);
-    const sharesAfter = await tokenBalance(connection, userAShareAccount);
+  it("deposit: A вносит 100 токенов → получает 100 shares", async () => {
+    // Токен-аккаунты пользователей и стартовые токены
+    for (const user of [userA, userB, userC]) {
+      const key = user.publicKey.toBase58();
+      tokenAcc[key] = await createAccount(provider.connection, admin, tokenMint, user.publicKey);
+      shareAcc[key] = await createAccount(provider.connection, admin, shareMintPDA, user.publicKey);
+      await mintTo(provider.connection, admin, tokenMint, tokenAcc[key], admin, 1000 * UNIT);
+    }
+
+    await deposit(userA, 100 * UNIT);
+
+    const shares = await getAccount(provider.connection, shareAcc[userA.publicKey.toBase58()]);
+    assert.equal(shares.amount, BigInt(100 * UNIT));
+
+    const card = await program.account.userCard.fetch(cardPda(userA.publicKey));
+    assert.equal(card.deposited.toNumber(), 100 * UNIT);
+    assert.equal(card.shares.toNumber(), 100 * UNIT);
+  });
+
+  it("deposit: B вносит 50 токенов → получает 50 shares", async () => {
+    await deposit(userB, 50 * UNIT);
+
+    const shares = await getAccount(provider.connection, shareAcc[userB.publicKey.toBase58()]);
+    assert.equal(shares.amount, BigInt(50 * UNIT));
+
     const vault = await program.account.vaultState.fetch(vaultStatePDA);
+    assert.equal(vault.totalTokens.toNumber(), 150 * UNIT);
+    assert.equal(vault.totalShares.toNumber(), 150 * UNIT);
 
-    console.log(`  Token balance: ${balanceBefore} → ${balanceAfter} (−${DEPOSIT_A})`);
-    console.log(`  Shares received: ${sharesAfter}`);
-    console.log(`  Vault: tokens=${vault.totalTokens}, shares=${vault.totalShares}`);
-
-    // Первый депозит: shares = tokens (1:1)
-    assert.equal(sharesAfter.toString(), DEPOSIT_A.toString());
-    assert.equal(vault.totalTokens.toString(), DEPOSIT_A.toString());
-    assert.equal(vault.totalShares.toString(), DEPOSIT_A.toString());
-    assert.equal(balanceBefore - balanceAfter, BigInt(DEPOSIT_A.toString()));
-
-    console.log(`  ✓ shares = tokens (первый депозит 1:1)`);
+    const vaultTokens = await getAccount(provider.connection, vaultTokenAccountPDA);
+    assert.equal(vaultTokens.amount, BigInt(150 * UNIT));
   });
 
-  // ─── 3. UserB deposit 50 ───────────────────────────────────────────────────
-  it("deposit: UserB вносит 50 токенов → получает 50 shares (соотношение сохраняется)", async () => {
-    const tx = await program.methods
-      .deposit(DEPOSIT_B)
-      .accountsPartial({
-        vaultState: vaultStatePDA,
-        vaultTokenAccount: vaultTokenAccountPDA,
-        shareMint: shareMintPDA,
-        userTokenAccount: userBTokenAccount,
-        userShareAccount: userBShareAccount,
-        user: userB.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([userB])
-      .rpc();
+  it("deposit: без карточки — ошибка", async () => {
+    let failed = false;
+    try {
+      await deposit(userC, 10 * UNIT);
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, "депозит без карточки должен быть отклонён");
+  });
 
-    console.log(`\n  UserB deposit tx: ${tx}`);
+  it("deposit: сумма 0 — ошибка", async () => {
+    let failed = false;
+    try {
+      await deposit(userA, 0);
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, "нулевой депозит должен быть отклонён");
+  });
 
-    const vaultBal = await tokenBalance(connection, vaultTokenAccountPDA);
-    const sharesBofB = await tokenBalance(connection, userBShareAccount);
+  it("withdraw: A возвращает 50 shares → получает 50 токенов", async () => {
+    const before = (await getAccount(provider.connection, tokenAcc[userA.publicKey.toBase58()])).amount;
+
+    await withdraw(userA, 50 * UNIT);
+
+    const after = (await getAccount(provider.connection, tokenAcc[userA.publicKey.toBase58()])).amount;
+    assert.equal(after - before, BigInt(50 * UNIT));
+
+    const shares = await getAccount(provider.connection, shareAcc[userA.publicKey.toBase58()]);
+    assert.equal(shares.amount, BigInt(50 * UNIT));
+
     const vault = await program.account.vaultState.fetch(vaultStatePDA);
+    assert.equal(vault.totalTokens.toNumber(), 100 * UNIT);
+    assert.equal(vault.totalShares.toNumber(), 100 * UNIT);
 
-    console.log(`  UserB shares: ${sharesBofB}`);
-    console.log(`  Vault tokens in account: ${vaultBal}`);
-    console.log(`  Vault state: tokens=${vault.totalTokens}, shares=${vault.totalShares}`);
-
-    // При 1:1 соотношении 50 токенов = 50 shares
-    assert.equal(sharesBofB.toString(), DEPOSIT_B.toString());
-    assert.equal(vault.totalTokens.toString(), DEPOSIT_A.add(DEPOSIT_B).toString());
-    assert.equal(vault.totalShares.toString(), DEPOSIT_A.add(DEPOSIT_B).toString());
-
-    // UserA владеет 100/150 = 66.7% vault, UserB — 50/150 = 33.3%
-    const sharesA = await tokenBalance(connection, userAShareAccount);
-    const total = BigInt(vault.totalShares.toString());
-    console.log(
-      `  UserA доля: ${Number(sharesA) / Number(total) * 100}%  ` +
-      `UserB доля: ${Number(sharesBofB) / Number(total) * 100}%`
-    );
-    console.log(`  ✓ Доли корректны: A=${sharesA}, B=${sharesBofB}, total=${total}`);
+    const card = await program.account.userCard.fetch(cardPda(userA.publicKey));
+    assert.equal(card.deposited.toNumber(), 50 * UNIT);
+    assert.equal(card.shares.toNumber(), 50 * UNIT);
   });
 
-  // ─── 4. UserA withdraw половина shares ─────────────────────────────────────
-  it("withdraw: UserA выводит 50 shares → получает 50 токенов обратно", async () => {
-    const sharesA = await tokenBalance(connection, userAShareAccount);
-    const halfShares = new BN(sharesA.toString()).divn(2);
+  it("withdraw: B выводит всё → shares сожжены, токены возвращены", async () => {
+    await withdraw(userB, 50 * UNIT);
 
-    const tokensBefore = await tokenBalance(connection, userATokenAccount);
+    const tokens = await getAccount(provider.connection, tokenAcc[userB.publicKey.toBase58()]);
+    assert.equal(tokens.amount, BigInt(1000 * UNIT)); // отдал 50, получил 50
+    const shares = await getAccount(provider.connection, shareAcc[userB.publicKey.toBase58()]);
+    assert.equal(shares.amount, BigInt(0));
 
-    const tx = await program.methods
-      .withdraw(halfShares)
-      .accountsPartial({
-        vaultState: vaultStatePDA,
-        vaultTokenAccount: vaultTokenAccountPDA,
-        shareMint: shareMintPDA,
-        userTokenAccount: userATokenAccount,
-        userShareAccount: userAShareAccount,
-        user: userA.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([userA])
-      .rpc();
-
-    console.log(`\n  UserA withdraw tx: ${tx}`);
-
-    const sharesAAfter = await tokenBalance(connection, userAShareAccount);
-    const tokensAfter = await tokenBalance(connection, userATokenAccount);
     const vault = await program.account.vaultState.fetch(vaultStatePDA);
-
-    const tokensReceived = tokensAfter - tokensBefore;
-    console.log(`  Shares сожжено: ${halfShares} (осталось ${sharesAAfter})`);
-    console.log(`  Токены получены: +${tokensReceived}`);
-    console.log(`  Vault state: tokens=${vault.totalTokens}, shares=${vault.totalShares}`);
-
-    // UserA вывел 50 из 150 tokens = 50 токенов
-    assert.equal(tokensReceived.toString(), halfShares.toString());
-    assert.equal(sharesAAfter.toString(), halfShares.toString()); // осталось 50 shares
-
-    console.log(`  ✓ Вывод корректен: получено ${tokensReceived} токенов за ${halfShares} shares`);
+    assert.equal(vault.totalTokens.toNumber(), 50 * UNIT);
+    assert.equal(vault.totalShares.toNumber(), 50 * UNIT);
   });
 
-  // ─── 5. Финальная проверка долей ───────────────────────────────────────────
-  it("итог: доли рассчитаны корректно после всех операций", async () => {
-    const sharesA = await tokenBalance(connection, userAShareAccount);
-    const sharesB = await tokenBalance(connection, userBShareAccount);
+  it("withdraw: сумма 0 — ошибка", async () => {
+    await mustFail(() => withdraw(userA, 0), "нулевой вывод должен быть отклонён");
+  });
+
+  it("withdraw: больше своих shares — ошибка", async () => {
+    await mustFail(() => withdraw(userA, 51 * UNIT), "нельзя вывести больше своих shares");
+  });
+
+  it("withdraw: без карточки — ошибка", async () => {
+    await mustFail(() => withdraw(userC, 1 * UNIT), "вывод без карточки должен быть отклонён");
+  });
+  it("week 10: CPI withdraw 10 shares, burn + PDA transfer", async () => {
+    const key = userA.publicKey.toBase58();
+    const beforeTokens = (await getAccount(provider.connection, tokenAcc[key])).amount;
+    const beforeShares = (await getAccount(provider.connection, shareAcc[key])).amount;
+    const beforeVault = (await getAccount(provider.connection, vaultTokenAccountPDA)).amount;
+    const beforeSupply = (await getMint(provider.connection, shareMintPDA)).supply;
+
+    // Token Program burns shares and transfers vault SPL tokens,
+    // with the transfer authorized by the vault PDA.
+    const signature = await withdraw(userA, 10 * UNIT);
+
+    const afterTokens = (await getAccount(provider.connection, tokenAcc[key])).amount;
+    const afterShares = (await getAccount(provider.connection, shareAcc[key])).amount;
+    const afterVault = (await getAccount(provider.connection, vaultTokenAccountPDA)).amount;
+    const afterSupply = (await getMint(provider.connection, shareMintPDA)).supply;
+
+    assert.equal(afterTokens - beforeTokens, BigInt(10 * UNIT));
+    assert.equal(beforeShares - afterShares, BigInt(10 * UNIT));
+    assert.equal(beforeVault - afterVault, BigInt(10 * UNIT));
+    assert.equal(beforeSupply - afterSupply, BigInt(10 * UNIT));
+
+    // After earlier tests: A = 50 shares, vault = 50 tokens.
+    // Following a 10-share withdrawal, both totals become 40.
     const vault = await program.account.vaultState.fetch(vaultStatePDA);
-    const vaultBal = await tokenBalance(connection, vaultTokenAccountPDA);
+    assert.equal(vault.totalTokens.toNumber(), 40 * UNIT);
+    assert.equal(vault.totalShares.toNumber(), 40 * UNIT);
 
-    const total = BigInt(vault.totalShares.toString());
-    const pctA = Number(sharesA) / Number(total) * 100;
-    const pctB = Number(sharesB) / Number(total) * 100;
+    const card = await program.account.userCard.fetch(cardPda(userA.publicKey));
+    assert.equal(card.deposited.toNumber(), 40 * UNIT);
+    assert.equal(card.shares.toNumber(), 40 * UNIT);
 
-    console.log(`\n=== Финальное состояние ===`);
-    console.log(`  Vault tokens (chain):  ${vaultBal}`);
-    console.log(`  Vault totalTokens:     ${vault.totalTokens}`);
-    console.log(`  Vault totalShares:     ${vault.totalShares}`);
-    console.log(`  UserA shares: ${sharesA} (${pctA.toFixed(1)}%)`);
-    console.log(`  UserB shares: ${sharesB} (${pctB.toFixed(1)}%)`);
-
-    // UserA: 50 shares, UserB: 50 shares → каждый по 50%
-    // Vault: 100 tokens (50 от A вывел, осталось 50 A + 50 B)
-    assert.equal(sharesA.toString(), sharesB.toString(), "A и B должны иметь равные доли");
-    assert.equal(vault.totalTokens.toString(), vault.totalShares.toString(), "1:1 ratio сохранён");
-
-    // Vault token account должен точно совпадать с totalTokens
-    assert.equal(vaultBal.toString(), vault.totalTokens.toString(), "on-chain баланс = state");
-
-    console.log(`  ✓ UserA = UserB = 50% vault`);
-    console.log(`  ✓ on-chain баланс совпадает с vault state`);
+    console.log("Week 10 withdraw success: burned 10 shares, returned 10 SPL tokens");
+    console.log("Transaction:", signature);
   });
+
 });
