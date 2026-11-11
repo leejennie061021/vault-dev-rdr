@@ -1,6 +1,5 @@
 /**
  * Тесты для Simple Vault на devnet
- *
  * Сценарий:
  *   1. Admin создаёт vault (initialize_vault)
  *   2. Пользователи A и B создают свои карточки (create_user_card)
